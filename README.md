@@ -45,6 +45,7 @@ Restart Codex (and terminals) after `install` so they pick up the proxy settings
 | `logs [-n N] [--guard]` | Tail of `logs/proxy.log` (or `logs/guard.log`) |
 | `ssh [cmd]` | SSH into the VM |
 | `down` | `terraform destroy` |
+| `phone setup / serve / url / rotate-password / disable` | Phone mirroring, see [Control the phone from anywhere](#control-the-phone-from-anywhere) |
 
 ## How apps are pointed at the proxy
 
@@ -61,10 +62,45 @@ curl -x http://127.0.0.1:8899 https://chatgpt.com/cdn-cgi/trace   # should show 
 uv run codex-vpn ssh -- uptime   # is the VM reachable?
 ```
 
+## Control the phone from anywhere
+
+An Android phone plugged into the home PC (USB debugging on, PC authorized) can be watched and controlled from any browser, for example a page added to your own phone's home screen: tap, swipe, type, back/home.
+
+```
+your phone's browser ──HTTPS + password──► VM: Caddy :443 ──► VM 127.0.0.1:18000
+                                                                   ▲ ssh -R (from the home PC)
+home PC: ws-scrcpy 127.0.0.1:8000 ──adb/USB──► Android phone ──────┘
+```
+
+- **ws-scrcpy** ([NetrisTV/ws-scrcpy](https://github.com/NetrisTV/ws-scrcpy), pinned to master commit `cd6cea6`, because the v0.8.1 release bundles a scrcpy server that shows a black screen on Android 14+) is cloned and built into `.tools/ws-scrcpy` (git-ignored). The build leaves out the adb shell, the file browser, the dev tools and iOS support, so the web page can only show and control the screen. It is patched to listen on `127.0.0.1` only, and the scrcpy server on the phone only listens on the phone's loopback.
+- **Relay**: `codex-vpn serve` runs ws-scrcpy (restarting it if it exits) and a separate `ssh -R 127.0.0.1:18000:127.0.0.1:8000` to the VM, so a phone-relay problem never affects the Codex tunnel.
+- **VM**: Caddy terminates HTTPS and asks for a password (HTTP basic auth, bcrypt hash only on the VM) before anything reaches ws-scrcpy. By default the site is the bare static IP (`https://<ip>`), with a Let's Encrypt IP-address certificate. Let's Encrypt only issues those with its 6-day `shortlived` profile, which Caddy (2.11 or newer, installed from Caddy's apt repo) renews on its own. Ports 80 (ACME HTTP-01 challenge, redirect) and 443 are opened only while the feature is enabled.
+
+```bash
+uv run codex-vpn phone setup        # needs git, Node.js, adb (winget install Genymobile.scrcpy); builds ws-scrcpy, creates .secrets/phone.json
+uv run codex-vpn up                 # opens 80/443, passes the password hash to the VM
+uv run codex-vpn ssh -- sudo google_metadata_script_runner startup   # apply Caddy config now (otherwise on next VM boot)
+uv run codex-vpn install            # (re)start serve, which now also runs ws-scrcpy and the relay
+uv run codex-vpn phone url          # URL, user, password
+```
+
+Open the URL, log in, and pick **WebCodecs** (smoothest in Chrome/Edge/Safari; Broadway, H264 Converter and Tiny H264 are slower software fallbacks). Use the browser's "Add to Home screen" for an app-like icon. `codex-vpn phone serve` runs only ws-scrcpy in the foreground for a local test at http://127.0.0.1:8000.
+
+If Let's Encrypt refuses the IP certificate (it is a newer feature), fall back to an `sslip.io` hostname with a regular certificate: `codex-vpn phone setup --sslip`, then `up` again (the URL becomes `https://<ip-with-dashes>.sslip.io`).
+
+**Security notes**
+
+- Anyone with the password controls the phone: they can read your SMS (including 2FA codes), open your apps and act as you. Treat the password like a bank password. It is 43 random characters; keep it that way and never share the URL with the password.
+- Basic auth has no rate limit or lockout; the password length is what makes guessing impossible. Don't replace it with something shorter.
+- Lock screen: when the phone is locked, the mirror shows the lock screen, and unlocking it from the browser means typing the PIN over this connection.
+- The phone stays controllable from the PC itself without a password (ws-scrcpy on 127.0.0.1:8000), like any adb connection.
+- **Rotate the password**: `codex-vpn phone rotate-password`, then `up` and the `google_metadata_script_runner` command above; `phone url` shows the new one.
+- **Disable**: `codex-vpn phone disable`, then `up` (closes 80/443) and the `google_metadata_script_runner` command above (stops Caddy; otherwise it stops on the next VM boot), and restart `serve` (`codex-vpn install`). Unplugging the phone or revoking USB debugging on it stops it immediately.
+
 ## Cost
 
 The e2-micro VM and 30 GB standard disk are in GCP's always-free tier (us-west1, us-central1, us-east1). You pay for the external IPv4 address (about $3.65/month) and egress beyond the free 1 GB/month.
 
 ## Files that stay local
 
-`.secrets/` (SSH key, known_hosts, VM address), `terraform/terraform.tfvars.json`, Terraform state and `logs/` are git-ignored.
+`.secrets/` (SSH key, known_hosts, VM address, phone login), `.tools/` (ws-scrcpy build), `terraform/terraform.tfvars.json`, Terraform state and `logs/` are git-ignored.

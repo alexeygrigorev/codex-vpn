@@ -12,7 +12,7 @@ import urllib.request
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from codex_vpn import guard, proxy
+from codex_vpn import guard, phone, proxy
 
 ROOT = Path(__file__).resolve().parents[2]
 TF_DIR = ROOT / "terraform"
@@ -33,6 +33,7 @@ RUN_NAME = "codex-vpn"
 INET_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 SSH_KEYGEN = r"C:\Windows\System32\OpenSSH\ssh-keygen.exe"
 SSH = r"C:\Windows\System32\OpenSSH\ssh.exe"
+PHONE = phone.Phone(ROOT)
 
 
 def run(cmd: list[str], check: bool = True, **kw) -> subprocess.CompletedProcess:
@@ -78,6 +79,7 @@ def cmd_up(args: argparse.Namespace) -> None:
         sys.exit("pass --project the first time")
     tfvars = {k: v for k, v in tfvars.items() if k in ("project", "region", "zone", "name")}
     tfvars["ssh_public_key"] = ensure_ssh_key()
+    tfvars.update(PHONE.tfvars())
     TFVARS.write_text(json.dumps(tfvars, indent=2))
     terraform("init", "-input=false", "-upgrade")
     terraform("apply", "-input=false", "-auto-approve")
@@ -115,9 +117,25 @@ def setup_logging(path: Path, verbose: bool = False) -> None:
     )
 
 
+def make_phone_relays() -> list[proxy.Tunnel]:
+    """When phone mirroring is on, publish ws-scrcpy on the VM's loopback for Caddy."""
+    if not PHONE.enabled:
+        return []
+    out = vm()
+    return [proxy.Tunnel(
+        host=out["ip"], user=out["ssh_user"], key=SSH_KEY, known_hosts=KNOWN_HOSTS, socks_port=0, ssh=SSH,
+        name="phone-relay", forwards=["-R", f"127.0.0.1:{phone.VM_PORT}:127.0.0.1:{phone.PORT}"],
+    )]
+
+
+async def serve_all(tunnel: proxy.Tunnel, relays: list[proxy.Tunnel]) -> None:
+    extra = [PHONE.supervise()] if PHONE.enabled else []
+    await asyncio.gather(proxy.serve(tunnel, PROXY_PORT, relays=relays), *extra)
+
+
 def cmd_serve(args: argparse.Namespace) -> None:
     setup_logging(LOG_FILE, args.verbose)
-    asyncio.run(proxy.serve(make_tunnel(), PROXY_PORT))
+    asyncio.run(serve_all(make_tunnel(), make_phone_relays()))
 
 
 def cmd_guard(args: argparse.Namespace) -> None:
@@ -203,6 +221,39 @@ def cmd_ssh(args: argparse.Namespace) -> None:
     sys.exit(result.returncode)
 
 
+def cmd_phone(args: argparse.Namespace) -> None:
+    if args.phone_command == "setup":
+        PHONE.setup()
+        data = PHONE.ensure_login(rotate=args.rotate_password)
+        if args.sslip is not None:
+            data["use_sslip"] = args.sslip
+        data["enabled"] = True
+        PHONE.secrets_file.write_text(json.dumps(data, indent=2))
+        print(f"login saved in {PHONE.secrets_file}; run `codex-vpn up` to configure the VM, "
+              "then restart `codex-vpn serve` (or re-run `install`)")
+    elif args.phone_command == "rotate-password":
+        PHONE.ensure_login(rotate=True)
+        print("new password saved; run `codex-vpn up` to push it to the VM, then `codex-vpn phone url`")
+    elif args.phone_command == "disable":
+        data = PHONE.settings()
+        if data:
+            data["enabled"] = False
+            PHONE.secrets_file.write_text(json.dumps(data, indent=2))
+        print("disabled; run `codex-vpn up` (closes ports 80/443, stops Caddy) and restart `codex-vpn serve`")
+    elif args.phone_command == "serve":
+        PHONE.serve()
+    elif args.phone_command == "url":
+        data = PHONE.settings()
+        if not data.get("password"):
+            sys.exit(f"no {PHONE.secrets_file}; run `codex-vpn phone setup` first")
+        ip = json.loads(VM_FILE.read_text()).get("ip") if VM_FILE.exists() else None
+        print(f"url:      {PHONE.url(ip)}")
+        print(f"user:     {data['user']}")
+        print(f"password: {data['password']}")
+        if not data.get("enabled"):
+            print("(phone mirroring is disabled)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="codex-vpn", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -235,6 +286,18 @@ def main() -> None:
     ssh = sub.add_parser("ssh", help="ssh into the VM")
     ssh.add_argument("command", nargs="*")
     ssh.set_defaults(func=cmd_ssh)
+
+    phone_p = sub.add_parser("phone", help="control the USB-attached Android phone from a browser (ws-scrcpy)")
+    phone_sub = phone_p.add_subparsers(dest="phone_command", required=True)
+    setup_p = phone_sub.add_parser("setup", help="build ws-scrcpy into .tools/ and create the login")
+    setup_p.add_argument("--rotate-password", action="store_true", help="replace the existing password")
+    setup_p.add_argument("--sslip", action=argparse.BooleanOptionalAction, default=None,
+                         help="serve on <ip>.sslip.io instead of the bare IP (fallback)")
+    phone_sub.add_parser("serve", help="run ws-scrcpy on 127.0.0.1:8000 in the foreground")
+    phone_sub.add_parser("url", help="print the URL, user and password")
+    phone_sub.add_parser("rotate-password", help="generate a new password")
+    phone_sub.add_parser("disable", help="turn phone mirroring off (then run `up`)")
+    phone_p.set_defaults(func=cmd_phone)
 
     args = parser.parse_args()
     args.func(args)
