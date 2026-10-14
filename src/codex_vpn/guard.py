@@ -3,7 +3,8 @@
 Every POLL seconds:
 - if the proxy does not answer, start it and close Codex right away
   (PAC-based apps fall back to direct when the proxy is gone);
-- if the proxy is up but the tunnel has been down for GRACE seconds, close Codex;
+- if the proxy is up but the tunnel is down, only log it: the proxy fails closed (502),
+  so nothing leaks and closing Codex would just lose work;
 - if a codex.exe process holds a direct (non-loopback) TCP connection, it is
   bypassing the proxy (e.g. started without HTTPS_PROXY) - close it.
 """
@@ -20,7 +21,6 @@ import psutil
 log = logging.getLogger("codex_vpn.guard")
 
 POLL = 2
-GRACE = 6
 RESTART_EVERY = 15
 NOTICE_EVERY = 30
 
@@ -42,7 +42,6 @@ def exempt(p: psutil.Process) -> bool:
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return False
     return any(m in exe for m in EXEMPT_PARENT_MARKERS)
-
 
 
 def codex_processes() -> list[psutil.Process]:
@@ -98,7 +97,7 @@ def proxy_status(url: str) -> dict | None:
 
 def run(status_url: str, start_proxy, dry_run: bool = False) -> None:
     log.info("guard: started (dry_run=%s)", dry_run)
-    down_since: float | None = None
+    was_healthy = True
     last_restart = 0.0
     last_notice = 0.0
 
@@ -112,7 +111,9 @@ def run(status_url: str, start_proxy, dry_run: bool = False) -> None:
             last_restart = now
 
         healthy = bool(status and status.get("tunnel_up"))
-        down_since = None if healthy else (down_since or now)
+        if status is not None and healthy != was_healthy:
+            log.warning("guard: tunnel %s", "back up" if healthy else "down (proxy fails closed, Codex left running)")
+            was_healthy = healthy
         procs = codex_processes()
 
         reason = ""
@@ -120,10 +121,6 @@ def run(status_url: str, start_proxy, dry_run: bool = False) -> None:
         if procs and status is None:
             # No proxy at all: PAC-based apps would silently fall back to direct.
             reason = "the codex-vpn proxy is not running"
-            victims = procs
-        elif procs and down_since is not None and now - down_since >= GRACE:
-            # Proxy up but tunnel down: requests already fail closed (502); close after a grace period.
-            reason = "the codex-vpn tunnel is down"
             victims = procs
         else:
             for p in procs:
