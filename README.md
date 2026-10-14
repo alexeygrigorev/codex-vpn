@@ -44,6 +44,7 @@ Restart Codex (and terminals) after `install` so they pick up the proxy settings
 | `status` | Prints `/status` from the running proxy |
 | `logs [-n N] [--guard]` | Tail of `logs/proxy.log` (or `logs/guard.log`) |
 | `ssh [cmd]` | SSH into the VM |
+| `rdp-client <device>` / `--list` / `--remove <device>` | Create, list or delete a Remote Desktop bundle for a device (see below) |
 | `down` | `terraform destroy` |
 
 ## How apps are pointed at the proxy
@@ -61,10 +62,48 @@ curl -x http://127.0.0.1:8899 https://chatgpt.com/cdn-cgi/trace   # should show 
 uv run codex-vpn ssh -- uptime   # is the VM reachable?
 ```
 
+## Remote Desktop from anywhere
+
+The same VM relays Remote Desktop to this PC, so you can reach it from a laptop or phone outside the home network without opening any port on the router or exposing RDP to the internet.
+
+```
+laptop / phone                           e2-micro VM                          home PC
+mstsc → localhost:13389                                                       Remote Desktop :3389
+   │                                                                               ▲
+ssh -L 13389 ══ SSH (user rdp) ══►  127.0.0.1:13389  ◄══ SSH (codexvpn) ══  ssh -R 13389:127.0.0.1:3389
+                                    (VM loopback only)                       (kept up by `codex-vpn serve`)
+```
+
+- The home PC keeps `ssh -R 127.0.0.1:13389:127.0.0.1:3389` open to the VM as a second ssh process next to the Codex tunnel (`rdp-relay` in `status`). If it fails, the Codex tunnel is unaffected.
+- A remote device connects as the `rdp` user with its own key and forwards its `localhost:13389` to the VM's `127.0.0.1:13389`, then points a Remote Desktop client at `localhost:13389`.
+
+Setup (Remote Desktop must already be enabled on this PC):
+
+```bash
+uv run codex-vpn rdp-client laptop   # .secrets/rdp-clients/laptop/: key, known_hosts, scripts, README.txt
+uv run codex-vpn up                  # adds the device key to the VM and applies the sshd restrictions
+uv run codex-vpn install             # restarts serve so it starts the rdp relay
+```
+
+Copy `.secrets/rdp-clients/laptop/` to the device, then:
+
+- **Windows**: double-click `connect-rdp.cmd` (tunnel in a minimized window, then `mstsc /v:localhost:13389`).
+- **macOS / Linux**: `sh connect-rdp.sh`, then connect an RDP client to `localhost:13389`.
+- **Phone**: follow `README.txt` (Termius with a local port forward 13389 → 127.0.0.1:13389, then Microsoft "Windows App" with PC `localhost:13389`).
+
+Sign in with this PC's Windows account password (not the PIN). The PC has to be awake and running `codex-vpn serve`.
+
+Security:
+
+- RDP is never exposed publicly: the firewall only allows SSH, and the relay port is bound to the VM's loopback (`GatewayPorts no`).
+- Each device has its own key. The `rdp` user can only open a forward to `127.0.0.1:13389`: no shell, no TTY, no other ports (`terraform/startup.sh`).
+- Windows still asks for the account password, so a leaked device key alone does not give access to the PC.
+- Revoke a device: `uv run codex-vpn rdp-client --remove laptop`, then `uv run codex-vpn up`. `rdp-client --list` shows which keys are on the VM.
+
 ## Cost
 
 The e2-micro VM and 30 GB standard disk are in GCP's always-free tier (us-west1, us-central1, us-east1). You pay for the external IPv4 address (about $3.65/month) and egress beyond the free 1 GB/month.
 
 ## Files that stay local
 
-`.secrets/` (SSH key, known_hosts, VM address), `terraform/terraform.tfvars.json`, Terraform state and `logs/` are git-ignored.
+`.secrets/` (SSH key, known_hosts, VM address, Remote Desktop device bundles), `terraform/terraform.tfvars.json`, Terraform state and `logs/` are git-ignored.

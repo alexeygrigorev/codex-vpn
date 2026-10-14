@@ -26,6 +26,7 @@ TUNNEL_DOMAINS = (
     "oaiusercontent.com",
 )
 CHECK_INTERVAL = 30
+RELAY_UP_AFTER = 5  # a relay counts as up once its ssh has run this long without exiting
 MAX_HEADER = 64 * 1024
 
 
@@ -60,6 +61,7 @@ class Tunnel:
     last_check: float = 0.0
     last_error: str = ""
     restarts: int = 0
+    started: float = 0.0
     proc: asyncio.subprocess.Process | None = None
 
     def command(self) -> list[str]:
@@ -81,7 +83,7 @@ class Tunnel:
     async def supervise(self) -> None:
         delay = 1
         while True:
-            started = time.monotonic()
+            started = self.started = time.monotonic()
             log.info("%s: starting %s to %s@%s", self.name, " ".join(self.command()[3:-1][:2]), self.user, self.host)
             self.proc = await asyncio.create_subprocess_exec(
                 *self.command(),
@@ -123,6 +125,16 @@ class Tunnel:
                 self.last_error = repr(e)
             self.last_check = time.time()
             await asyncio.sleep(CHECK_INTERVAL if self.up else 5)
+
+    def relay_status(self) -> dict:
+        """Relays have no check loop: "up" means the ssh process has been running for RELAY_UP_AFTER seconds."""
+        running = self.proc is not None and self.proc.returncode is None
+        return {
+            "up": running and time.monotonic() - self.started > RELAY_UP_AFTER,
+            "forwards": " ".join(self.forwards),
+            "restarts": self.restarts,
+            "last_error": self.last_error,
+        }
 
     def status(self) -> dict:
         return {
@@ -172,9 +184,13 @@ async def pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> int:
 
 
 class Proxy:
-    def __init__(self, tunnel: Tunnel, port: int):
+    def __init__(self, tunnel: Tunnel, port: int, relays: list[Tunnel] = ()):
         self.tunnel = tunnel
         self.port = port
+        self.relays = list(relays)
+
+    def status(self) -> dict:
+        return {**self.tunnel.status(), "relays": {r.name: r.relay_status() for r in self.relays}}
 
     async def respond(self, writer, status: str, body: str, ctype: str = "text/plain") -> None:
         data = body.encode()
@@ -202,7 +218,7 @@ class Proxy:
             if target.startswith("/proxy.pac"):
                 await self.respond(writer, "200 OK", pac_script(self.port), "application/x-ns-proxy-autoconfig")
             elif target.startswith("/status"):
-                await self.respond(writer, "200 OK", json.dumps(self.tunnel.status(), indent=2) + "\n", "application/json")
+                await self.respond(writer, "200 OK", json.dumps(self.status(), indent=2) + "\n", "application/json")
             else:
                 await self.respond(writer, "404 Not Found", "try /status or /proxy.pac\n")
             return
@@ -247,7 +263,7 @@ class Proxy:
 async def serve(tunnel: Tunnel, port: int, relays: list[Tunnel] = ()) -> None:
     """Run the proxy, its tunnel, and any extra relays (separate ssh processes, so a relay
     failure never takes the Codex tunnel down)."""
-    proxy = Proxy(tunnel, port)
+    proxy = Proxy(tunnel, port, relays)
     server = await asyncio.start_server(proxy.handle, "127.0.0.1", port, limit=MAX_HEADER)
     log.info("proxy: listening on 127.0.0.1:%d, tunneling %s", port, ", ".join(TUNNEL_DOMAINS))
     async with server:
