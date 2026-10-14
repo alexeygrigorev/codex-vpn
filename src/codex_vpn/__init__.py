@@ -162,6 +162,8 @@ def make_phone_relays() -> list[proxy.Tunnel]:
 
 async def serve_all(tunnel: proxy.Tunnel, relays: list[proxy.Tunnel]) -> None:
     extra = [PHONE.supervise()] if PHONE.enabled else []
+    if PHONE.proxy_enabled:
+        extra.append(PHONE.keep_proxy(PROXY_PORT))
     await asyncio.gather(proxy.serve(tunnel, PROXY_PORT, relays=relays), *extra)
 
 
@@ -495,6 +497,20 @@ def cmd_phone(args: argparse.Namespace) -> None:
         print("disabled; run `codex-vpn up` (closes ports 80/443, stops Caddy) and restart `codex-vpn serve`")
     elif args.phone_command == "serve":
         PHONE.serve()
+    elif args.phone_command == "proxy":
+        if args.state == "on":
+            PHONE.set_proxy_enabled(True)
+            for change in PHONE.apply_proxy(PROXY_PORT) or ["already set"]:
+                print(change)
+            print("on; `codex-vpn serve` keeps it applied (restart serve, or re-run `install`, to start that)")
+        elif args.state == "off":
+            PHONE.set_proxy_enabled(False)
+            serials = PHONE.clear_proxy(PROXY_PORT)
+            print(f"off; cleared on {', '.join(serials) or 'no attached phone (plug it in and run this again)'}")
+        else:
+            print(f"enabled: {PHONE.proxy_enabled}")
+            for serial, value in PHONE.proxy_state().items():
+                print(f"{serial}: http_proxy={value}")
     elif args.phone_command == "url":
         data = PHONE.settings()
         if not data.get("password"):
@@ -560,6 +576,8 @@ def main() -> None:
     phone_sub.add_parser("url", help="print the URL, user and password")
     phone_sub.add_parser("rotate-password", help="generate a new password")
     phone_sub.add_parser("disable", help="turn phone mirroring off (then run `up`)")
+    proxy_p = phone_sub.add_parser("proxy", help="route the phone's traffic through the codex-vpn proxy over USB")
+    proxy_p.add_argument("state", nargs="?", choices=["on", "off", "status"], default="status")
     phone_p.set_defaults(func=cmd_phone)
 
     args = parser.parse_args()

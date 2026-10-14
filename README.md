@@ -137,6 +137,17 @@ If Let's Encrypt refuses the IP certificate (it is a newer feature), fall back t
 - **Rotate the password**: `codex-vpn phone rotate-password`, then `up`; `phone url` shows the new one.
 - **Disable**: `codex-vpn phone disable`, then `up` (closes 80/443 and stops Caddy), and restart `serve` (`codex-vpn install`). Unplugging the phone or revoking USB debugging on it stops it immediately.
 
+### Route the phone through the tunnel
+
+```bash
+uv run codex-vpn phone proxy on       # or: off, status
+```
+
+Over USB, `adb reverse tcp:8899` makes the phone's `127.0.0.1:8899` reach the PC's proxy, and Android's global HTTP proxy points there. OpenAI hosts (the ChatGPT app, the browser) take the tunnel like on the PC; everything else goes out direct through the PC. `serve` re-applies both every 10 s, so it recovers after a replug or a phone reboot (a reboot drops `adb reverse`). This is independent of mirroring.
+
+- The proxy setting stays on the phone when it is unplugged, and apps that use the system proxy have no network until it is plugged back in (or the PC's proxy is back). `phone proxy off` (with the phone attached) removes it; on the phone itself, `adb shell settings put global http_proxy :0` does the same.
+- Apps that ignore the system proxy are not covered.
+
 ## Cost
 
 The e2-micro VM and 30 GB standard disk are in GCP's always-free tier (us-west1, us-central1, us-east1). You pay for the external IPv4 address (about $3.65/month) and egress beyond the free 1 GB/month.

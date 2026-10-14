@@ -232,6 +232,64 @@ class Phone:
             delay = 1 if time.monotonic() - started > 60 else min(delay * 2, 30)
             await asyncio.sleep(delay)
 
+    # ---- route the phone's traffic through the proxy ---------------------------------------
+    # `adb reverse` makes the phone's 127.0.0.1:<port> reach the PC's proxy over USB, and Android's
+    # global HTTP proxy points there, so OpenAI hosts take the tunnel like on the PC (the rest goes out
+    # direct from the PC). The setting survives unplugging: while the phone is off USB, apps that use
+    # the system proxy have no network until it is plugged back in (`phone proxy off` undoes it).
+    @property
+    def proxy_enabled(self) -> bool:
+        return bool(self.settings().get("proxy"))
+
+    def set_proxy_enabled(self, on: bool) -> None:
+        data = self.settings()
+        data["proxy"] = on
+        self.secrets_file.parent.mkdir(exist_ok=True)
+        self.secrets_file.write_text(json.dumps(data, indent=2))
+
+    def adb(self, *args: str, serial: str | None = None) -> str:
+        cmd = [self.find_adb(), *(["-s", serial] if serial else []), *args]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return result.stdout.strip()
+
+    def devices(self) -> list[str]:
+        lines = self.adb("devices").splitlines()[1:]
+        return [line.split("\t")[0] for line in lines if line.endswith("\tdevice")]
+
+    def apply_proxy(self, port: int) -> list[str]:
+        """Make sure every attached phone has the reverse port and the global proxy; return what changed."""
+        changes = []
+        for serial in self.devices():
+            if f"tcp:{port} tcp:{port}" not in self.adb("reverse", "--list", serial=serial):
+                self.adb("reverse", f"tcp:{port}", f"tcp:{port}", serial=serial)
+                changes.append(f"{serial}: adb reverse tcp:{port}")
+            if self.adb("shell", "settings", "get", "global", "http_proxy", serial=serial) != f"127.0.0.1:{port}":
+                self.adb("shell", "settings", "put", "global", "http_proxy", f"127.0.0.1:{port}", serial=serial)
+                changes.append(f"{serial}: global http_proxy -> 127.0.0.1:{port}")
+        return changes
+
+    def clear_proxy(self, port: int) -> list[str]:
+        serials = self.devices()
+        for serial in serials:
+            self.adb("shell", "settings", "put", "global", "http_proxy", ":0", serial=serial)
+            self.adb("reverse", "--remove", f"tcp:{port}", serial=serial)
+        return serials
+
+    def proxy_state(self) -> dict:
+        return {serial: self.adb("shell", "settings", "get", "global", "http_proxy", serial=serial)
+                for serial in self.devices()}
+
+    async def keep_proxy(self, port: int, every: int = 10) -> None:
+        """Re-apply after the phone is replugged or rebooted (a reboot drops `adb reverse`)."""
+        while True:
+            try:
+                for change in await asyncio.to_thread(self.apply_proxy, port):
+                    log.info("phone: %s", change)
+            except (Exception, SystemExit) as e:  # find_adb() exits when adb is missing; keep serving
+                log.warning("phone: proxy setup failed: %r", e)
+            await asyncio.sleep(every)
+
     def url(self, ip: str | None) -> str:
         if not ip:
             return "https://<vm-ip>"
