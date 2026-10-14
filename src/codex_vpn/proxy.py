@@ -272,6 +272,7 @@ async def serve(tunnel: Tunnel, port: int, relays: list[Tunnel] = ()) -> None:
     """Run the proxy, its tunnel, and any extra relays (separate ssh processes, so a relay
     failure never takes the Codex tunnel down)."""
     proxy = Proxy(tunnel, port, relays)
+    asyncio.get_running_loop().set_exception_handler(ignore_proactor_resets)
     server = await asyncio.start_server(proxy.handle, "127.0.0.1", port, limit=MAX_HEADER)
     log.info("proxy: listening on 127.0.0.1:%d, tunneling %s", port, ", ".join(TUNNEL_DOMAINS))
     async with server:
