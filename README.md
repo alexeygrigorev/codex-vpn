@@ -9,7 +9,7 @@ Codex app / codex CLI / browser
 local proxy 127.0.0.1:8899  ──────────────►  direct (everything else)
         │ openai.com, chatgpt.com, oaistatic.com, oaiusercontent.com
         ▼
-ssh -D 127.0.0.1:18899  ══ SSH ══►  e2-micro VM in us-central1  ──►  OpenAI
+ssh -D 127.0.0.1:18899  ══ SSH ══►  e2-micro VM in us-east1  ──►  OpenAI
 ```
 
 - **Infra**: Terraform creates one free-tier `e2-micro` VM (Debian 12) with a static IP and an SSH-only firewall rule. Login is key-only for a dedicated `codexvpn` user.

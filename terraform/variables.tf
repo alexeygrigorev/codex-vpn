@@ -5,13 +5,13 @@ variable "project" {
 
 variable "region" {
   type        = string
-  default     = "us-central1"
+  default     = "us-east1"
   description = "Free-tier e2-micro regions: us-west1, us-central1, us-east1."
 }
 
 variable "zone" {
   type    = string
-  default = "us-central1-a"
+  default = "us-east1-b"
 }
 
 variable "name" {
