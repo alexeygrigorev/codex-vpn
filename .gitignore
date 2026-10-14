@@ -8,3 +8,4 @@ terraform/terraform.tfvars.json
 terraform/.terraform.tfstate.lock.info
 logs/
 .pytest_cache/
+.tools/
