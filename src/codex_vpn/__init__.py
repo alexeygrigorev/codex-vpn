@@ -13,6 +13,8 @@ import urllib.request
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+import psutil
+
 from codex_vpn import guard, phone, proxy
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -189,15 +191,44 @@ def reg(*args: str) -> None:
     run(["reg", *args, "/f"], capture_output=True)
 
 
+def ours(p: psutil.Process) -> bool:
+    return (p.name() or "").lower() in ("pythonw.exe", "codex-vpn.exe") and "codex_vpn" in " ".join(p.cmdline())
+
+
+def background_processes(*subs: str) -> list[psutil.Process]:
+    pattern = re.compile("|".join(rf"codex_vpn {s}\b|codex-vpn\.exe.? {s}\b" for s in subs))
+    found = []
+    for p in psutil.process_iter():
+        try:
+            if ours(p) and pattern.search(" ".join(p.cmdline())):
+                found.append(p)
+        except psutil.Error:
+            pass
+    return found
+
+
 def stop_background(*subs: str) -> None:
-    pattern = "|".join(f"codex_vpn {s}|codex-vpn.exe.? {s}" for s in subs)
-    subprocess.run(
-        ["powershell", "-NoProfile", "-Command",
-         "Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe' or Name='codex-vpn.exe'\" | "
-         f"Where-Object CommandLine -match '{pattern}' | "
-         "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"],
-        check=False,
-    )
+    """Stop background codex-vpn processes and their children (ssh tunnels/relays, ws-scrcpy):
+    an orphaned relay keeps holding its port on the VM, so the next one cannot bind it."""
+
+    def tree(p: psutil.Process) -> list[psutil.Process]:
+        # The guard starts `serve`, so a serve is the guard's child: don't descend into codex-vpn processes
+        # (the ones being stopped, like the venv launcher's child, are matched on their own).
+        found = [p]
+        for child in p.children():
+            try:
+                if not ours(child):
+                    found += tree(child)
+            except psutil.Error:
+                pass
+        return found
+
+    victims = [v for p in background_processes(*subs) for v in tree(p)]
+    for p in victims:
+        try:
+            p.kill()
+        except psutil.NoSuchProcess:
+            pass
 
 
 def cmd_install(args: argparse.Namespace) -> None:
