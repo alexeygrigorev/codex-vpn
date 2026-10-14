@@ -12,7 +12,7 @@ import urllib.request
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from codex_vpn import proxy
+from codex_vpn import guard, proxy
 
 ROOT = Path(__file__).resolve().parents[2]
 TF_DIR = ROOT / "terraform"
@@ -22,6 +22,7 @@ KNOWN_HOSTS = SECRETS / "known_hosts"
 TFVARS = TF_DIR / "terraform.tfvars.json"
 VM_FILE = SECRETS / "vm.json"
 LOG_FILE = ROOT / "logs" / "proxy.log"
+GUARD_LOG = ROOT / "logs" / "guard.log"
 
 PROXY_PORT = 8899
 SOCKS_PORT = 18899
@@ -102,31 +103,40 @@ def make_tunnel() -> proxy.Tunnel:
     )
 
 
-def cmd_serve(args: argparse.Namespace) -> None:
-    LOG_FILE.parent.mkdir(exist_ok=True)
-    handlers: list[logging.Handler] = [RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=3, encoding="utf-8")]
+def setup_logging(path: Path, verbose: bool = False) -> None:
+    path.parent.mkdir(exist_ok=True)
+    handlers: list[logging.Handler] = [RotatingFileHandler(path, maxBytes=5_000_000, backupCount=3, encoding="utf-8")]
     if sys.stderr and sys.stderr.isatty():
         handlers.append(logging.StreamHandler())
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(message)s",
         handlers=handlers,
     )
+
+
+def cmd_serve(args: argparse.Namespace) -> None:
+    setup_logging(LOG_FILE, args.verbose)
     asyncio.run(proxy.serve(make_tunnel(), PROXY_PORT))
 
 
-def serve_command() -> str:
+def cmd_guard(args: argparse.Namespace) -> None:
+    setup_logging(GUARD_LOG)
+    guard.run(f"{PROXY_URL}/status", lambda: start_background("serve"), dry_run=args.dry_run)
+
+
+def background_command(sub: str) -> str:
     pythonw = ROOT / ".venv" / "Scripts" / "pythonw.exe"
-    return f'"{pythonw}" -m codex_vpn serve'
+    return f'"{pythonw}" -m codex_vpn {sub}'
 
 
-def start_server() -> None:
+def start_background(sub: str) -> None:
     flags = (
         subprocess.DETACHED_PROCESS
         | subprocess.CREATE_NEW_PROCESS_GROUP
         | subprocess.CREATE_BREAKAWAY_FROM_JOB
     )
-    subprocess.Popen(serve_command(), creationflags=flags, close_fds=True, cwd=ROOT,
+    subprocess.Popen(background_command(sub), creationflags=flags, close_fds=True, cwd=ROOT,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -134,25 +144,27 @@ def reg(*args: str) -> None:
     run(["reg", *args, "/f"], capture_output=True)
 
 
-def stop_server() -> None:
+def stop_background(*subs: str) -> None:
+    pattern = "|".join(f"codex_vpn {s}|codex-vpn.exe.? {s}" for s in subs)
     subprocess.run(
         ["powershell", "-NoProfile", "-Command",
          "Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe' or Name='codex-vpn.exe'\" | "
-         "Where-Object CommandLine -match 'codex_vpn serve|codex-vpn.exe.? serve' | "
+         f"Where-Object CommandLine -match '{pattern}' | "
          "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"],
         check=False,
     )
 
 
 def cmd_install(args: argparse.Namespace) -> None:
-    """Start the proxy at logon and point Codex (env proxy) and Chromium apps (PAC) at it."""
-    reg("add", RUN_KEY, "/v", RUN_NAME, "/t", "REG_SZ", "/d", serve_command())
+    """Run the guard (which keeps the proxy up) at logon and point Codex (env proxy) and Chromium apps (PAC) at it."""
+    reg("add", RUN_KEY, "/v", RUN_NAME, "/t", "REG_SZ", "/d", background_command("guard"))
     for name in ("HTTPS_PROXY", "HTTP_PROXY"):
         run(["setx", name, PROXY_URL], capture_output=True)
     run(["setx", "NO_PROXY", NO_PROXY], capture_output=True)
     reg("add", INET_KEY, "/v", "AutoConfigURL", "/t", "REG_SZ", "/d", f"{PROXY_URL}/proxy.pac")
-    stop_server()
-    start_server()
+    stop_background("guard", "serve")
+    start_background("serve")
+    start_background("guard")
     print("installed; restart Codex (and terminals) so they pick up the proxy settings")
 
 
@@ -164,7 +176,7 @@ def cmd_uninstall(args: argparse.Namespace) -> None:
     # setx of a dummy var broadcasts WM_SETTINGCHANGE so new processes see the removal.
     run(["setx", "CODEX_VPN_UNINSTALLED", "1"], capture_output=True)
     run(["reg", "delete", r"HKCU\Environment", "/v", "CODEX_VPN_UNINSTALLED", "/f"], check=False, capture_output=True)
-    stop_server()
+    stop_background("guard", "serve")
     print("uninstalled")
 
 
@@ -177,9 +189,10 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 
 def cmd_logs(args: argparse.Namespace) -> None:
-    if not LOG_FILE.exists():
-        sys.exit(f"no log at {LOG_FILE}")
-    lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    path = GUARD_LOG if args.guard else LOG_FILE
+    if not path.exists():
+        sys.exit(f"no log at {path}")
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     print("\n".join(lines[-args.n:]))
 
 
@@ -206,12 +219,17 @@ def main() -> None:
     serve.add_argument("-v", "--verbose", action="store_true", help="also log direct connections")
     serve.set_defaults(func=cmd_serve)
 
-    sub.add_parser("install", help="run the proxy at logon and point Codex at it").set_defaults(func=cmd_install)
+    guard_p = sub.add_parser("guard", help="keep the proxy up and close Codex if it could bypass the tunnel")
+    guard_p.add_argument("--dry-run", action="store_true", help="log what would be closed, close nothing")
+    guard_p.set_defaults(func=cmd_guard)
+
+    sub.add_parser("install", help="run the guard + proxy at logon and point Codex at it").set_defaults(func=cmd_install)
     sub.add_parser("uninstall", help="undo install").set_defaults(func=cmd_uninstall)
     sub.add_parser("status", help="tunnel status and exit location").set_defaults(func=cmd_status)
 
     logs = sub.add_parser("logs", help="show the end of the proxy log")
     logs.add_argument("-n", type=int, default=40)
+    logs.add_argument("--guard", action="store_true", help="show the guard log instead of the proxy log")
     logs.set_defaults(func=cmd_logs)
 
     ssh = sub.add_parser("ssh", help="ssh into the VM")
