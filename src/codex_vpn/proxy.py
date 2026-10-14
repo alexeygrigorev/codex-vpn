@@ -4,7 +4,9 @@
 - Hosts matching TUNNEL_DOMAINS go through `ssh -D` (SOCKS5) to the VM; everything else goes direct.
 - Fail-closed: if the tunnel is down, tunneled hosts get 502 instead of leaking out directly.
 - Serves /proxy.pac and /status on the same port.
-- Keeps the ssh process alive and checks the exit location every CHECK_INTERVAL seconds.
+- Keeps the ssh process alive and checks the exit location every CHECK_INTERVAL seconds;
+  if the check keeps failing for RESTART_AFTER seconds, restarts ssh (it can hang while still running).
+- POST /restart (with header X-Codex-Vpn: restart) restarts the tunnel's ssh on demand.
 """
 
 import asyncio
@@ -26,6 +28,7 @@ TUNNEL_DOMAINS = (
     "oaiusercontent.com",
 )
 CHECK_INTERVAL = 30
+RESTART_AFTER = 60  # restart ssh when the tunnel check has failed this long
 RELAY_UP_AFTER = 5  # a relay counts as up once its ssh has run this long without exiting
 MAX_HEADER = 64 * 1024
 
@@ -105,8 +108,17 @@ class Tunnel:
             delay = 1 if time.monotonic() - started > 60 else min(delay * 2, 30)
             await asyncio.sleep(delay)
 
+    def restart(self, why: str) -> bool:
+        """Kill the ssh process; supervise() starts a new one."""
+        if self.proc is None or self.proc.returncode is not None:
+            return False
+        log.warning("%s: restarting (%s)", self.name, why)
+        self.proc.kill()
+        return True
+
     async def check(self) -> None:
         """Fetch Cloudflare's trace through the tunnel to confirm it works and where it exits."""
+        failing_since: float | None = None
         while True:
             try:
                 reader, writer = await asyncio.wait_for(socks_connect(self.socks_port, "chatgpt.com", 80), 10)
@@ -118,11 +130,16 @@ class Tunnel:
                 if not self.up:
                     log.info("tunnel: up, exit %s", self.exit_info)
                 self.up = True
+                failing_since = None
             except Exception as e:
                 if self.up:
                     log.error("tunnel: check failed: %r", e)
                 self.up = False
                 self.last_error = repr(e)
+                now = time.monotonic()
+                failing_since = failing_since or now
+                if now - failing_since >= RESTART_AFTER and self.restart(f"check failing for {now - failing_since:.0f}s"):
+                    failing_since = now
             self.last_check = time.time()
             await asyncio.sleep(CHECK_INTERVAL if self.up else 5)
 
@@ -217,6 +234,14 @@ class Proxy:
         if target.startswith("/"):
             if target.startswith("/proxy.pac"):
                 await self.respond(writer, "200 OK", pac_script(self.port), "application/x-ns-proxy-autoconfig")
+            elif target.startswith("/restart") and method == "POST":
+                # The custom header keeps web pages from triggering this (it would need a CORS preflight).
+                if b"\r\nx-codex-vpn: restart" not in head.lower():
+                    await self.respond(writer, "403 Forbidden", "missing X-Codex-Vpn: restart header\n")
+                elif self.tunnel.restart("requested via /restart"):
+                    await self.respond(writer, "200 OK", "tunnel ssh restarting\n")
+                else:
+                    await self.respond(writer, "409 Conflict", "tunnel ssh is not running (already restarting)\n")
             elif target.startswith("/status"):
                 await self.respond(writer, "200 OK", json.dumps(self.status(), indent=2) + "\n", "application/json")
             else:

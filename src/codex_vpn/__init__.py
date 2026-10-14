@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -264,6 +265,19 @@ def cmd_status(args: argparse.Namespace) -> None:
         sys.exit(f"proxy not reachable at {PROXY_URL}: {e}\nstart it with `codex-vpn serve` or `codex-vpn install`")
 
 
+def cmd_restart(args: argparse.Namespace) -> None:
+    """Restart the tunnel's ssh only; the relays (Remote Desktop, phone) keep running."""
+    req = urllib.request.Request(f"{PROXY_URL}/restart", method="POST", headers={"X-Codex-Vpn": "restart"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            print(r.read().decode().strip())
+    except urllib.error.HTTPError as e:
+        sys.exit(e.read().decode().strip())
+    except OSError:
+        print("proxy not running; starting it")
+        start_background("serve")
+
+
 def cmd_logs(args: argparse.Namespace) -> None:
     path = GUARD_LOG if args.guard else LOG_FILE
     if not path.exists():
@@ -477,6 +491,7 @@ def main() -> None:
     sub.add_parser("install", help="run the guard + proxy at logon and point Codex at it").set_defaults(func=cmd_install)
     sub.add_parser("uninstall", help="undo install").set_defaults(func=cmd_uninstall)
     sub.add_parser("status", help="tunnel status and exit location").set_defaults(func=cmd_status)
+    sub.add_parser("restart", help="restart the tunnel (relays keep running)").set_defaults(func=cmd_restart)
 
     logs = sub.add_parser("logs", help="show the end of the proxy log")
     logs.add_argument("-n", type=int, default=40)
