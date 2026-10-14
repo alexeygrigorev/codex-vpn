@@ -260,6 +260,14 @@ class Proxy:
         log.log(level, "%-6s %s:%s up=%d down=%d %.1fs", route, host, port, sent, received, time.monotonic() - started)
 
 
+def ignore_proactor_resets(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """Windows' proactor loop logs a traceback when a peer resets a socket that is already
+    closing (ConnectionResetError in _call_connection_lost). It is harmless; keep the log readable."""
+    if isinstance(context.get("exception"), ConnectionResetError):
+        return
+    loop.default_exception_handler(context)
+
+
 async def serve(tunnel: Tunnel, port: int, relays: list[Tunnel] = ()) -> None:
     """Run the proxy, its tunnel, and any extra relays (separate ssh processes, so a relay
     failure never takes the Codex tunnel down)."""

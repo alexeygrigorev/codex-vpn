@@ -9,3 +9,4 @@ terraform/.terraform.tfstate.lock.info
 logs/
 .pytest_cache/
 .tools/
+.claude/
