@@ -116,8 +116,7 @@ home PC: ws-scrcpy 127.0.0.1:8000 ──adb/USB──► Android phone ───
 
 ```bash
 uv run codex-vpn phone setup        # needs git, Node.js, adb (winget install Genymobile.scrcpy); builds ws-scrcpy, creates .secrets/phone.json
-uv run codex-vpn up                 # opens 80/443, passes the password hash to the VM
-uv run codex-vpn ssh -- sudo google_metadata_script_runner startup   # apply Caddy config now (otherwise on next VM boot)
+uv run codex-vpn up                 # opens 80/443, passes the password hash to the VM, applies the Caddy config
 uv run codex-vpn install            # (re)start serve, which now also runs ws-scrcpy and the relay
 uv run codex-vpn phone url          # URL, user, password
 ```
@@ -132,8 +131,8 @@ If Let's Encrypt refuses the IP certificate (it is a newer feature), fall back t
 - Basic auth has no rate limit or lockout; the password length is what makes guessing impossible. Don't replace it with something shorter.
 - Lock screen: when the phone is locked, the mirror shows the lock screen, and unlocking it from the browser means typing the PIN over this connection.
 - The phone stays controllable from the PC itself without a password (ws-scrcpy on 127.0.0.1:8000), like any adb connection.
-- **Rotate the password**: `codex-vpn phone rotate-password`, then `up` and the `google_metadata_script_runner` command above; `phone url` shows the new one.
-- **Disable**: `codex-vpn phone disable`, then `up` (closes 80/443) and the `google_metadata_script_runner` command above (stops Caddy; otherwise it stops on the next VM boot), and restart `serve` (`codex-vpn install`). Unplugging the phone or revoking USB debugging on it stops it immediately.
+- **Rotate the password**: `codex-vpn phone rotate-password`, then `up`; `phone url` shows the new one.
+- **Disable**: `codex-vpn phone disable`, then `up` (closes 80/443 and stops Caddy), and restart `serve` (`codex-vpn install`). Unplugging the phone or revoking USB debugging on it stops it immediately.
 
 ## Cost
 
