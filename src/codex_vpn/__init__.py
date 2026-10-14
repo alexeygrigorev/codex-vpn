@@ -34,6 +34,8 @@ PROXY_URL = f"http://127.0.0.1:{PROXY_PORT}"
 NO_PROXY = "localhost,127.0.0.1,::1"
 RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = "codex-vpn"
+WATCHDOG_TASK = "codex-vpn-watchdog"
+WATCHDOG_EVERY_MIN = 2
 INET_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 SSH_KEYGEN = r"C:\Windows\System32\OpenSSH\ssh-keygen.exe"
 SSH = r"C:\Windows\System32\OpenSSH\ssh.exe"
@@ -232,9 +234,41 @@ def stop_background(*subs: str) -> None:
             pass
 
 
+def cmd_ensure(args: argparse.Namespace) -> None:
+    """Run by the watchdog task: start the guard (which keeps `serve` up) if it is not running."""
+    if not background_processes("guard"):
+        start_background("guard")
+
+
+def install_watchdog() -> bool:
+    """Schedule `ensure` at boot and every WATCHDOG_EVERY_MIN minutes, logged on or not (S4U: no stored
+    password), so the Remote Desktop relay comes back after a crash or an unattended reboot.
+    Registering a task that runs without a logon needs admin; without it, fall back to logged-on only.
+    Returns True when the boot-time task was registered."""
+    pythonw = ROOT / ".venv" / "Scripts" / "pythonw.exe"
+    script = f"""
+$action = New-ScheduledTaskAction -Execute '{pythonw}' -Argument '-m codex_vpn ensure' -WorkingDirectory '{ROOT}'
+$triggers = @((New-ScheduledTaskTrigger -AtStartup),
+  (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes {WATCHDOG_EVERY_MIN})))
+$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\\$env:USERNAME" -LogonType S4U -RunLevel Limited
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
+  -ExecutionTimeLimit (New-TimeSpan) -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName '{WATCHDOG_TASK}' -Action $action -Trigger $triggers -Principal $principal `
+  -Settings $settings -Force -ErrorAction Stop | Out-Null
+"""
+    result = run(["powershell", "-NoProfile", "-Command", script], check=False, capture_output=True, text=True)
+    if result.returncode == 0:
+        return True
+    run(["schtasks", "/Create", "/TN", WATCHDOG_TASK, "/SC", "MINUTE", "/MO", str(WATCHDOG_EVERY_MIN),
+         "/TR", background_command("ensure"), "/F"], capture_output=True)
+    return False
+
+
 def cmd_install(args: argparse.Namespace) -> None:
-    """Run the guard (which keeps the proxy up) at logon and point Codex (env proxy) and Chromium apps (PAC) at it."""
-    reg("add", RUN_KEY, "/v", RUN_NAME, "/t", "REG_SZ", "/d", background_command("guard"))
+    """Run the guard (which keeps the proxy up) at boot/logon and point Codex (env proxy) and Chromium apps (PAC) at it."""
+    # `ensure`, not `guard`: when the boot-time task already started a guard, logon must not add a second one.
+    reg("add", RUN_KEY, "/v", RUN_NAME, "/t", "REG_SZ", "/d", background_command("ensure"))
+    at_boot = install_watchdog()
     for name in ("HTTPS_PROXY", "HTTP_PROXY"):
         run(["setx", name, PROXY_URL], capture_output=True)
     run(["setx", "NO_PROXY", NO_PROXY], capture_output=True)
@@ -243,10 +277,15 @@ def cmd_install(args: argparse.Namespace) -> None:
     start_background("serve")
     start_background("guard")
     print("installed; restart Codex (and terminals) so they pick up the proxy settings")
+    if not at_boot:
+        print("note: not running as admin, so codex-vpn starts at logon only (not at boot). After a reboot\n"
+              "nothing runs until you log in, so Remote Desktop from outside is unavailable. To start at boot,\n"
+              "re-run `uv run codex-vpn install` from an Administrator terminal.")
 
 
 def cmd_uninstall(args: argparse.Namespace) -> None:
     reg("delete", RUN_KEY, "/v", RUN_NAME)
+    run(["schtasks", "/Delete", "/TN", WATCHDOG_TASK, "/F"], check=False, capture_output=True)
     for name in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"):
         run(["reg", "delete", r"HKCU\Environment", "/v", name, "/f"], check=False, capture_output=True)
     run(["reg", "delete", INET_KEY, "/v", "AutoConfigURL", "/f"], check=False, capture_output=True)
@@ -490,6 +529,8 @@ def main() -> None:
 
     sub.add_parser("install", help="run the guard + proxy at logon and point Codex at it").set_defaults(func=cmd_install)
     sub.add_parser("uninstall", help="undo install").set_defaults(func=cmd_uninstall)
+    sub.add_parser("ensure", help="start the guard if it is not running (run by the watchdog task)"
+                   ).set_defaults(func=cmd_ensure)
     sub.add_parser("status", help="tunnel status and exit location").set_defaults(func=cmd_status)
     sub.add_parser("restart", help="restart the tunnel (relays keep running)").set_defaults(func=cmd_restart)
 

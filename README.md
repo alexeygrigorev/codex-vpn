@@ -17,7 +17,7 @@ ssh -D 127.0.0.1:18899  ══ SSH ══►  e2-micro VM in us-east1  ──►
 - **Local proxy** (`src/codex_vpn/proxy.py`, stdlib only): HTTP CONNECT/HTTP proxy that sends OpenAI domains through the tunnel and everything else direct. It is **fail-closed**: when the tunnel is down, OpenAI hosts get `502` instead of leaking out over your own IP.
 - **Guard** (`src/codex_vpn/guard.py`): Codex never starts or keeps running without the tunnel. Every 2 s it restarts the proxy if it is gone, closes Codex immediately when the proxy is not running (PAC-based apps would fall back to direct), only logs when the tunnel is down (the proxy already answers `502`, so nothing leaks), and closes any `codex.exe` that holds a direct, non-proxied connection (for example a CLI started before `HTTPS_PROXY` was set). The desktop app's browser/computer-use runtime clears `HTTPS_PROXY` for its `codex.exe`, so that one is left alone.
 - **Debuggable**: every tunneled connection is logged (`logs/proxy.log`), and `/status` shows whether the tunnel is up and where it exits (checked through Cloudflare's `/cdn-cgi/trace` every 30 s).
-- **Self-healing**: `serve` restarts the tunnel's ssh when it exits, and also when it is still running but the check has failed for 60 s (a hung connection). The guard restarts `serve` itself if it dies. `codex-vpn restart` restarts the tunnel by hand; the Remote Desktop and phone relays are separate ssh processes and keep running, so you can do it from Remote Desktop when you are away.
+- **Self-healing**: `serve` restarts the tunnel's ssh when it exits, and also when it is still running but the check has failed for 60 s (a hung connection). The guard restarts `serve` itself if it dies, and a scheduled task (`codex-vpn-watchdog`, added by `install`) starts the guard at boot (before anyone logs in) and every 2 min if it is not running, so the Remote Desktop relay comes back on its own, including after an unattended reboot. `codex-vpn restart` restarts the tunnel by hand; the Remote Desktop and phone relays are separate ssh processes and keep running, so you can do it from Remote Desktop when you are away.
 
 ## Requirements
 
@@ -30,19 +30,20 @@ ssh -D 127.0.0.1:18899  ══ SSH ══►  e2-micro VM in us-east1  ──►
 ```bash
 gcloud auth login --update-adc               # terraform uses application default credentials
 uv run codex-vpn up --project <gcp-project>   # ssh key + terraform apply
-uv run codex-vpn install                      # guard + proxy at logon, set PAC + HTTPS_PROXY
+uv run codex-vpn install                      # guard + proxy at boot, set PAC + HTTPS_PROXY (run as admin)
 uv run codex-vpn status                       # tunnel up? exit ip/location?
 ```
 
-Restart Codex (and terminals) after `install` so they pick up the proxy settings.
+Restart Codex (and terminals) after `install` so they pick up the proxy settings. Run `install` from an Administrator terminal: starting at boot without a logon needs admin to register. Without it, codex-vpn starts only at logon, so after a reboot Remote Desktop from outside is unavailable until someone logs in at the PC.
 
 | Command | What it does |
 |---|---|
 | `up [--project --region --zone]` | Generates `.secrets/id_ed25519` if needed and runs `terraform apply` |
 | `serve [-v]` | Runs the proxy + tunnel in the foreground (`-v` also logs direct connections) |
 | `guard [--dry-run]` | Runs the guard in the foreground (`--dry-run` logs instead of closing anything) |
-| `install` / `uninstall` | Adds/removes the logon entry (the guard, which starts the proxy), `HTTP(S)_PROXY`/`NO_PROXY` user variables and the PAC `AutoConfigURL` |
+| `install` / `uninstall` | Adds/removes the boot/logon watchdog task and logon entry (they start the guard, which starts the proxy), `HTTP(S)_PROXY`/`NO_PROXY` user variables and the PAC `AutoConfigURL` |
 | `status` | Prints `/status` from the running proxy |
+| `ensure` | Starts the guard if it is not running (what the watchdog task runs) |
 | `restart` | Restarts the tunnel's ssh (relays keep running); starts the proxy if it is not running |
 | `logs [-n N] [--guard]` | Tail of `logs/proxy.log` (or `logs/guard.log`) |
 | `ssh [cmd]` | SSH into the VM |
