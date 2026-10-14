@@ -15,7 +15,7 @@ ssh -D 127.0.0.1:18899  ══ SSH ══►  e2-micro VM in us-east1  ──►
 - **Infra**: Terraform creates one free-tier `e2-micro` VM (Debian 12) with a static IP and an SSH-only firewall rule. Login is key-only for a dedicated `codexvpn` user.
 - **Transport**: Windows' built-in OpenSSH (`ssh -D`), restarted automatically if it drops.
 - **Local proxy** (`src/codex_vpn/proxy.py`, stdlib only): HTTP CONNECT/HTTP proxy that sends OpenAI domains through the tunnel and everything else direct. It is **fail-closed**: when the tunnel is down, OpenAI hosts get `502` instead of leaking out over your own IP.
-- **Guard** (`src/codex_vpn/guard.py`): Codex never starts or keeps running without the tunnel. Every 2 s it restarts the proxy if it is gone, closes Codex immediately when the proxy is not running (PAC-based apps would fall back to direct), closes it when the tunnel has been down for 6 s, and closes any `codex.exe` that holds a direct, non-proxied connection (for example a CLI started before `HTTPS_PROXY` was set).
+- **Guard** (`src/codex_vpn/guard.py`): Codex never starts or keeps running without the tunnel. Every 2 s it restarts the proxy if it is gone, closes Codex immediately when the proxy is not running (PAC-based apps would fall back to direct), closes it when the tunnel has been down for 6 s, and closes any `codex.exe` that holds a direct, non-proxied connection (for example a CLI started before `HTTPS_PROXY` was set). The desktop app's browser/computer-use runtime clears `HTTPS_PROXY` for its `codex.exe`, so that one is left alone.
 - **Debuggable**: every tunneled connection is logged (`logs/proxy.log`), and `/status` shows whether the tunnel is up and where it exits (checked through Cloudflare's `/cdn-cgi/trace` every 30 s).
 
 ## Requirements

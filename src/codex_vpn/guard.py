@@ -30,6 +30,19 @@ CODEX_PATH_MARKERS = ("\\windowsapps\\openai.codex_", "\\openai\\codex\\", "@ope
 # Processes whose own traffic must always go through the proxy (they honor HTTPS_PROXY).
 PROXY_ONLY_NAMES = {"codex.exe"}
 LOOPBACK = ("127.", "::1")
+# The desktop app's browser/computer-use runtime starts `codex app-server` with a cleared environment
+# (no HTTPS_PROXY), so it always goes direct. That leak is accepted; don't kill it.
+EXEMPT_PARENT_MARKERS = ("\\runtimes\\cua_node\\",)
+
+
+def exempt(p: psutil.Process) -> bool:
+    try:
+        parent = p.parent()
+        exe = (parent.exe() if parent else "").lower()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+    return any(m in exe for m in EXEMPT_PARENT_MARKERS)
+
 
 
 def codex_processes() -> list[psutil.Process]:
@@ -114,7 +127,7 @@ def run(status_url: str, start_proxy, dry_run: bool = False) -> None:
             victims = procs
         else:
             for p in procs:
-                if p.info["name"].lower() in PROXY_ONLY_NAMES:
+                if p.info["name"].lower() in PROXY_ONLY_NAMES and not exempt(p):
                     direct = direct_connections(p)
                     if direct:
                         log.warning("guard: pid %s %s bypasses the proxy: %s", p.pid, p.info["exe"], ", ".join(direct[:5]))
