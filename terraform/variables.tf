@@ -38,3 +38,9 @@ variable "ssh_source_ranges" {
   type    = list(string)
   default = ["0.0.0.0/0"]
 }
+
+variable "rdp_public_keys" {
+  type        = list(string)
+  default     = []
+  description = "OpenSSH public keys (one per device) allowed to reach the home PC's Remote Desktop relay."
+}

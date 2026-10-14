@@ -57,8 +57,12 @@ resource "google_compute_instance" "vpn" {
   }
 
   metadata = {
-    ssh-keys               = "${var.ssh_user}:${var.ssh_public_key}"
+    ssh-keys = join("\n", concat(
+      ["${var.ssh_user}:${var.ssh_public_key}"],
+      [for k in var.rdp_public_keys : "rdp:${k}"],
+    ))
     block-project-ssh-keys = "true"
+    startup-script         = file("${path.module}/startup.sh")
   }
 
   scheduling {

@@ -53,6 +53,8 @@ class Tunnel:
     known_hosts: Path
     socks_port: int
     ssh: str = r"C:\Windows\System32\OpenSSH\ssh.exe"
+    name: str = "ssh"
+    forwards: list[str] = field(default_factory=list)
     up: bool = False
     exit_info: dict = field(default_factory=dict)
     last_check: float = 0.0
@@ -61,9 +63,10 @@ class Tunnel:
     proc: asyncio.subprocess.Process | None = None
 
     def command(self) -> list[str]:
+        forwards = self.forwards or ["-D", f"127.0.0.1:{self.socks_port}"]
         return [
             self.ssh, "-N", "-T",
-            "-D", f"127.0.0.1:{self.socks_port}",
+            *forwards,
             "-i", str(self.key),
             "-o", "IdentitiesOnly=yes",
             "-o", "BatchMode=yes",
@@ -79,7 +82,7 @@ class Tunnel:
         delay = 1
         while True:
             started = time.monotonic()
-            log.info("ssh: starting tunnel to %s@%s (socks 127.0.0.1:%d)", self.user, self.host, self.socks_port)
+            log.info("%s: starting %s to %s@%s", self.name, " ".join(self.command()[3:-1][:2]), self.user, self.host)
             self.proc = await asyncio.create_subprocess_exec(
                 *self.command(),
                 stdin=asyncio.subprocess.DEVNULL,
@@ -92,11 +95,11 @@ class Tunnel:
                 text = line.decode(errors="replace").strip()
                 if text:
                     self.last_error = text
-                    log.warning("ssh: %s", text)
+                    log.warning("%s: %s", self.name, text)
             code = await self.proc.wait()
             self.up = False
             self.restarts += 1
-            log.error("ssh: exited with code %s", code)
+            log.error("%s: exited with code %s", self.name, code)
             delay = 1 if time.monotonic() - started > 60 else min(delay * 2, 30)
             await asyncio.sleep(delay)
 
@@ -241,9 +244,13 @@ class Proxy:
         log.log(level, "%-6s %s:%s up=%d down=%d %.1fs", route, host, port, sent, received, time.monotonic() - started)
 
 
-async def serve(tunnel: Tunnel, port: int) -> None:
+async def serve(tunnel: Tunnel, port: int, relays: list[Tunnel] = ()) -> None:
+    """Run the proxy, its tunnel, and any extra relays (separate ssh processes, so a relay
+    failure never takes the Codex tunnel down)."""
     proxy = Proxy(tunnel, port)
     server = await asyncio.start_server(proxy.handle, "127.0.0.1", port, limit=MAX_HEADER)
     log.info("proxy: listening on 127.0.0.1:%d, tunneling %s", port, ", ".join(TUNNEL_DOMAINS))
     async with server:
-        await asyncio.gather(server.serve_forever(), tunnel.supervise(), tunnel.check())
+        await asyncio.gather(
+            server.serve_forever(), tunnel.supervise(), tunnel.check(), *(r.supervise() for r in relays)
+        )
