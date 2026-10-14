@@ -264,8 +264,8 @@ class Proxy:
         started = time.monotonic()
         try:
             if route == "tunnel":
-                if not self.tunnel.up:
-                    raise ConnectionError("tunnel is down (fail-closed)")
+                # Always try the tunnel, even when the last check failed: a check can time out while
+                # the tunnel still works. Tunneled hosts never fall back to direct, so this stays fail-closed.
                 up_reader, up_writer = await asyncio.wait_for(socks_connect(self.tunnel.socks_port, host, port), 15)
             else:
                 up_reader, up_writer = await asyncio.wait_for(asyncio.open_connection(host, port), 15)
