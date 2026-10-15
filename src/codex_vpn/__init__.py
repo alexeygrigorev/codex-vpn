@@ -16,7 +16,7 @@ from pathlib import Path
 
 import psutil
 
-from codex_vpn import guard, phone, proxy
+from codex_vpn import guard, home, phone, proxy
 
 ROOT = Path(__file__).resolve().parents[2]
 TF_DIR = ROOT / "terraform"
@@ -40,6 +40,8 @@ INET_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 SSH_KEYGEN = r"C:\Windows\System32\OpenSSH\ssh-keygen.exe"
 SSH = r"C:\Windows\System32\OpenSSH\ssh.exe"
 PHONE = phone.Phone(ROOT)
+HOME_FILE = SECRETS / "home.json"
+HOME_KEY = SECRETS / "home_id_ed25519"
 
 # Remote Desktop relay: the home PC publishes its RDP port on the VM's loopback (ssh -R),
 # remote devices reach it with ssh -L as the restricted "rdp" user (see terraform/startup.sh).
@@ -162,9 +164,76 @@ def make_phone_relays() -> list[proxy.Tunnel]:
 
 async def serve_all(tunnel: proxy.Tunnel, relays: list[proxy.Tunnel]) -> None:
     extra = [PHONE.supervise()] if PHONE.enabled else []
+    home_relays = home.make_relays(HOME_FILE, SSH)
+    if home_relays:
+        extra.append(proxy.serve_home(home.PORT, home_relays))
     if PHONE.proxy_enabled:
         extra.append(PHONE.keep_proxy(PROXY_PORT))
     await asyncio.gather(proxy.serve(tunnel, PROXY_PORT, relays=relays), *extra)
+
+
+def port_number(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("port must be an integer") from None
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
+
+
+def cmd_home(args: argparse.Namespace) -> None:
+    if args.home_command == "serve":
+        setup_logging(ROOT / "logs" / "home.log", args.verbose)
+        asyncio.run(proxy.serve_home(home.PORT, home.make_relays(HOME_FILE, SSH)))
+        return
+    if args.home_command == "status":
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+            f"http://127.0.0.1:{home.PORT}/status", timeout=5
+        ) as response:
+            print(response.read().decode())
+        return
+    data = home.settings(HOME_FILE)
+    if args.home_command == "list":
+        print(json.dumps(data, indent=2))
+        return
+    if not DEVICE_NAME.fullmatch(args.name):
+        sys.exit("bad name: use letters, digits, '-' or '_', up to 32 characters")
+    if args.home_command == "remove":
+        if args.name not in data:
+            sys.exit(f"no home relay named {args.name}")
+        del data[args.name]
+        home.save(HOME_FILE, data)
+        print("removed; restart serve to close the relay")
+        return
+    if args.name in data:
+        sys.exit("relay already exists; remove it before replacing it")
+    if args.vm:
+        out = vm()
+        host, user, key = out["ip"], out["ssh_user"], SSH_KEY
+    else:
+        if not args.host or not args.user:
+            sys.exit("give --host and --user, or --vm for the existing GCP relay")
+        host, user = args.host, args.user
+        if not re.fullmatch(r"[A-Za-z0-9._:-]+", host) or host.startswith("-"):
+            sys.exit("invalid SSH hostname/IP")
+        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", user):
+            sys.exit("invalid SSH username")
+        key = Path(args.key).expanduser().resolve() if args.key else HOME_KEY
+        if args.key and not key.is_file():
+            sys.exit(f"SSH key does not exist: {key}")
+        if not key.exists():
+            SECRETS.mkdir(exist_ok=True)
+            run([SSH_KEYGEN, "-q", "-t", "ed25519", "-N", "", "-C", "codex-vpn-home", "-f", str(key)])
+    data[args.name] = {"host": host, "user": user, "key": str(key),
+                       "ssh_port": args.ssh_port, "remote_port": args.remote_port}
+    home.save(HOME_FILE, data)
+    if key.with_suffix(".pub").exists():
+        print("Authorize this public key on the remote server (never copy the private key):")
+        print(key.with_suffix(".pub").read_text().strip())
+    print(f"saved; restart serve, or run `codex-vpn home serve` independently.\n"
+          f"Remote proxy: http://127.0.0.1:{args.remote_port}\n"
+          "Remote sshd must allow remote forwarding and have GatewayPorts no.")
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
@@ -579,6 +648,24 @@ def main() -> None:
     proxy_p = phone_sub.add_parser("proxy", help="route the phone's traffic through the codex-vpn proxy over USB")
     proxy_p.add_argument("state", nargs="?", choices=["on", "off", "status"], default="status")
     phone_p.set_defaults(func=cmd_phone)
+
+    home_p = sub.add_parser("home", help="home-exit HTTP proxy for remote browsers")
+    home_sub = home_p.add_subparsers(dest="home_command", required=True)
+    add = home_sub.add_parser("add", help="save a reverse SSH relay target")
+    add.add_argument("name")
+    add.add_argument("--vm", action="store_true", help="use the existing GCP VM as relay")
+    add.add_argument("--host")
+    add.add_argument("--user")
+    add.add_argument("--key", help="existing private SSH key (default: dedicated generated home key)")
+    add.add_argument("--ssh-port", type=port_number, default=22)
+    add.add_argument("--remote-port", type=port_number, default=home.REMOTE_PORT)
+    remove = home_sub.add_parser("remove", help="remove a saved relay (restart serve afterwards)")
+    remove.add_argument("name")
+    home_sub.add_parser("list", help="list saved relays")
+    home_sub.add_parser("status", help="show home proxy and relay status")
+    home_serve = home_sub.add_parser("serve", help="run home proxy independently, without GCP/Codex")
+    home_serve.add_argument("-v", "--verbose", action="store_true")
+    home_p.set_defaults(func=cmd_home)
 
     args = parser.parse_args()
     args.func(args)

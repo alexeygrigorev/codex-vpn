@@ -148,6 +148,138 @@ Over USB, `adb reverse tcp:8899` makes the phone's `127.0.0.1:8899` reach the PC
 - The proxy setting stays on the phone when it is unplugged, and apps that use the system proxy have no network until it is plugged back in (or the PC's proxy is back). `phone proxy off` (with the phone attached) removes it; on the phone itself, `adb shell settings put global http_proxy :0` does the same.
 - Apps that ignore the system proxy are not covered.
 
+## Home-exit proxy for remote Chromium / Playwright
+
+The same GCP VM and paid public IP can run all these services together:
+
+| Service | Traffic path | Public IP seen by the destination |
+|---|---|---|
+| Codex proxy | Desktop -> GCP -> OpenAI | GCP's US IP |
+| Remote Desktop | Remote device -> GCP -> desktop's RDP service | Connects to this desktop |
+| Home-exit browser proxy | Remote Chromium -> GCP -> desktop -> website | Desktop's home IP |
+
+To reuse the existing GCP VM for the browser proxy, configure it on the home desktop:
+
+```powershell
+uv run codex-vpn home add gcp --vm
+```
+
+Run this once; `home list` shows saved targets. Restart `codex-vpn serve` after adding
+the target (or re-run `uv run codex-vpn install` for the installed background service).
+If the target is already configured and running, no additional setup on the desktop
+is needed. Check it with `uv run codex-vpn home status`.
+
+On the remote server, keep an SSH tunnel to the GCP VM running in one terminal:
+
+```bash
+ssh -N -T -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+  -i /path/to/authorized_key \
+  -L 127.0.0.1:18900:127.0.0.1:18900 codexvpn@GCP_IP
+```
+
+Replace `GCP_IP` with the VM's public IP and use a key authorized for that account.
+Use a key held on the remote server; keep the desktop's private key on the desktop.
+The restricted `rdp` account cannot access this proxy port.
+
+Then launch Chromium in another terminal on that server:
+
+```bash
+chromium --proxy-server="http://127.0.0.1:18900" https://example.com
+```
+
+Only the browser configured with this proxy uses the home connection; other services
+on the remote server keep their normal route. Keep both the SSH tunnel and the home
+desktop running. The proxy port stays private on GCP's loopback interface.
+
+Configure only the browser to use this proxy: the remote server's other applications
+keep their normal network route. All HTTP/HTTPS requests sent to this separate proxy,
+including OpenAI domains, open their outgoing connection on the home desktop. Websites
+see the desktop's home public IP. HTTPS is forwarded with CONNECT without decrypting TLS.
+The existing Codex proxy on port 8899 keeps its original routing.
+
+```text
+Remote Chromium -> remote localhost:18900 -> SSH -> this desktop:8900 -> website
+```
+
+On the home desktop, add each remote server:
+
+```powershell
+uv run codex-vpn home add hetzner --host YOUR_SERVER --user YOUR_SSH_USER
+# Optional: --key C:\path\to\existing_key --ssh-port 2222 --remote-port 18901
+```
+
+This saves `.secrets/home.json` and generates a dedicated SSH key when no key is
+provided. Add the printed **public** key to the remote user's `~/.ssh/authorized_keys`.
+Keep the private key on this desktop. The remote SSH server must allow remote TCP
+forwarding (`AllowTcpForwarding remote` or `yes`) and use `GatewayPorts no` so the proxy
+cannot become publicly reachable. Other local users on that server can access its
+loopback proxy; use a server you trust. No home router ports need to be opened.
+See the [OpenSSH server configuration reference](https://man.openbsd.org/sshd_config).
+
+Start the proxy and relays on this desktop:
+
+```powershell
+uv run codex-vpn home serve
+uv run codex-vpn home status   # from another terminal
+```
+
+Alternatively, configured home relays start alongside the existing `codex-vpn serve`
+and its installed watchdog. Restart that process after changing the saved targets.
+Run only one instance of the home proxy at a time. Each relay reconnects independently.
+`codex-vpn restart` restarts only the original Codex tunnel, not these relays.
+
+On the remote server, configure Chromium explicitly (no global proxy variables):
+
+```bash
+chromium --proxy-server="http://127.0.0.1:18900" https://example.com
+```
+
+Or configure [Playwright's browser proxy](https://playwright.dev/python/docs/network):
+
+```python
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(proxy={"server": "http://127.0.0.1:18900"})
+    page = browser.new_page()
+    page.goto("https://example.com")
+    browser.close()
+```
+
+Verify the exit from the remote server:
+
+```bash
+curl --noproxy '' --proxy http://127.0.0.1:18900 https://www.cloudflare.com/cdn-cgi/trace
+```
+
+Compare its `ip=` with the desktop's direct public IP. With this desktop asleep or
+offline, requests through the proxy fail. This is an HTTP/HTTPS proxy, not a whole-browser
+VPN: WebRTC/UDP and applications that ignore the explicit proxy are outside its scope.
+Browser automation can still be detected independently of the source IP.
+For a browser inside Docker, `127.0.0.1` refers to that container; on Linux, host networking
+lets it access this host-loopback endpoint without exposing the proxy publicly.
+
+To use the paid GCP IP as an intermediate relay instead of connecting home directly to
+Hetzner:
+
+```powershell
+uv run codex-vpn home add gcp --vm
+```
+
+Then on the remote server, use your own authorized SSH account/key to the GCP VM:
+
+```bash
+ssh -N -T -L 127.0.0.1:18900:127.0.0.1:18900 USER@GCP_IP
+```
+
+Point Chromium at the same `http://127.0.0.1:18900`. GCP carries the tunnel;
+the final outgoing connection still originates on this desktop. The restricted `rdp`
+account cannot forward to this port. The extra SSH hop must stay running too.
+
+Manage targets with `home list` and `home remove NAME`; restart serve after removal
+to close the active forwarding. Standalone home logs are in `logs/home.log`; integrated
+logs are in `logs/proxy.log`. Status reports SSH process state, not an end-to-end exit check.
+
 ## Cost
 
 The e2-micro VM and 30 GB standard disk are in GCP's always-free tier (us-west1, us-central1, us-east1). You pay for the external IPv4 address (about $3.65/month) and egress beyond the free 1 GB/month.

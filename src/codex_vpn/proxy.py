@@ -59,6 +59,7 @@ class Tunnel:
     ssh: str = r"C:\Windows\System32\OpenSSH\ssh.exe"
     name: str = "ssh"
     forwards: list[str] = field(default_factory=list)
+    ssh_port: int = 22
     up: bool = False
     exit_info: dict = field(default_factory=dict)
     last_check: float = 0.0
@@ -72,6 +73,7 @@ class Tunnel:
         return [
             self.ssh, "-N", "-T",
             *forwards,
+            "-p", str(self.ssh_port),
             "-i", str(self.key),
             "-o", "IdentitiesOnly=yes",
             "-o", "BatchMode=yes",
@@ -201,13 +203,14 @@ async def pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> int:
 
 
 class Proxy:
-    def __init__(self, tunnel: Tunnel, port: int, relays: list[Tunnel] = ()):
+    def __init__(self, tunnel: Tunnel | None, port: int, relays: list[Tunnel] = ()):
         self.tunnel = tunnel
         self.port = port
         self.relays = list(relays)
 
     def status(self) -> dict:
-        return {**self.tunnel.status(), "relays": {r.name: r.relay_status() for r in self.relays}}
+        info = self.tunnel.status() if self.tunnel else {"mode": "home-exit"}
+        return {**info, "relays": {r.name: r.relay_status() for r in self.relays}}
 
     async def respond(self, writer, status: str, body: str, ctype: str = "text/plain") -> None:
         data = body.encode()
@@ -233,8 +236,14 @@ class Proxy:
 
         if target.startswith("/"):
             if target.startswith("/proxy.pac"):
-                await self.respond(writer, "200 OK", pac_script(self.port), "application/x-ns-proxy-autoconfig")
+                script = pac_script(self.port) if self.tunnel else (
+                    f'function FindProxyForURL(url, host) {{ return "PROXY 127.0.0.1:{self.port}"; }}\n'
+                )
+                await self.respond(writer, "200 OK", script, "application/x-ns-proxy-autoconfig")
             elif target.startswith("/restart") and method == "POST":
+                if self.tunnel is None:
+                    await self.respond(writer, "404 Not Found", "home proxy has no outgoing tunnel\n")
+                    return
                 # The custom header keeps web pages from triggering this (it would need a CORS preflight).
                 if b"\r\nx-codex-vpn: restart" not in head.lower():
                     await self.respond(writer, "403 Forbidden", "missing X-Codex-Vpn: restart header\n")
@@ -260,10 +269,11 @@ class Proxy:
             forward = f"{method} {path} {version}\r\n".encode() + b"\r\n".join(headers) + b"\r\nConnection: close\r\n\r\n"
         host = host.strip("[]")
 
-        route = "tunnel" if is_tunneled(host) else "direct"
+        route = "tunnel" if self.tunnel and is_tunneled(host) else "direct"
         started = time.monotonic()
         try:
             if route == "tunnel":
+                assert self.tunnel is not None
                 # Always try the tunnel, even when the last check failed: a check can time out while
                 # the tunnel still works. Tunneled hosts never fall back to direct, so this stays fail-closed.
                 up_reader, up_writer = await asyncio.wait_for(socks_connect(self.tunnel.socks_port, host, port), 15)
@@ -281,7 +291,7 @@ class Proxy:
             up_writer.write(forward)
 
         sent, received = await asyncio.gather(pipe(reader, up_writer), pipe(up_reader, writer))
-        level = logging.INFO if route == "tunnel" else logging.DEBUG
+        level = logging.INFO if route == "tunnel" or self.tunnel is None else logging.DEBUG
         log.log(level, "%-6s %s:%s up=%d down=%d %.1fs", route, host, port, sent, received, time.monotonic() - started)
 
 
@@ -304,3 +314,12 @@ async def serve(tunnel: Tunnel, port: int, relays: list[Tunnel] = ()) -> None:
         await asyncio.gather(
             server.serve_forever(), tunnel.supervise(), tunnel.check(), *(r.supervise() for r in relays)
         )
+
+
+async def serve_home(port: int, relays: list[Tunnel]) -> None:
+    """A separate proxy whose outgoing connections always originate on this PC."""
+    home = Proxy(None, port, relays)
+    server = await asyncio.start_server(home.handle, "127.0.0.1", port, limit=MAX_HEADER)
+    log.info("home proxy: listening on 127.0.0.1:%d", port)
+    async with server:
+        await asyncio.gather(server.serve_forever(), *(r.supervise() for r in relays))
